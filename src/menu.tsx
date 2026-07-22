@@ -16,6 +16,7 @@ import { superuser } from 'superuser';
 
 import { debug } from "./common.ts";
 import type { ClipboardInfo, FilesContextType, FolderFileInfo } from "./common.ts";
+import { show_compress_dialog } from './dialogs/compress.tsx';
 import { show_copy_paste_as_owner } from "./dialogs/copyPasteOwnership.tsx";
 import { show_create_file_dialog } from './dialogs/create-file.tsx';
 import { confirm_delete } from './dialogs/delete.tsx';
@@ -179,13 +180,23 @@ export function get_menu_items(
                     onClick: () => downloadFile(path, item)
                 }
             );
-        } else if (item.type === "dir" && supportsTerminal) {
+        } else if (item.type === "dir") {
+            if (supportsTerminal) {
+                menuItems.push(
+                    { type: "divider" },
+                    {
+                        id: "terminal",
+                        title: _("Open in terminal"),
+                        onClick: () => cockpit.jump("/system/terminal#/?path=" + encodeURIComponent(path + item.name))
+                    }
+                );
+            }
             menuItems.push(
                 { type: "divider" },
                 {
-                    id: "terminal",
-                    title: _("Open in terminal"),
-                    onClick: () => cockpit.jump("/system/terminal#/?path=" + encodeURIComponent(path + item.name))
+                    id: "compress-item",
+                    title: _("Compress"),
+                    onClick: () => show_compress_dialog(dialogs, path, item)
                 }
             );
         }
