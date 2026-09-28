@@ -1,0 +1,143 @@
+name: Build plugin
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  # Cockpit identifies this package by its manifest and installs it under this
+  # directory name; keep it in sync with package.json "name".
+  PLUGIN_NAME: files
+  # The tarball below wraps dist/ in a directory named after the plugin, so the
+  # installer unwraps one level to land manifest.json at the plugin root.
+  STRIP_COMPONENTS: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        # No committed package-lock.json in this repo (it is generated from
+        # cockpit's node-cache), so install from package.json rather than npm ci.
+        run: npm install
+
+      - name: Check out cockpit build helpers
+        # build.js imports esbuild plugins from pkg/lib, which is not committed
+        # but fetched from the cockpit repo pinned in the Makefile.
+        run: make pkg/lib
+
+      - name: Build plugin
+        run: NODE_ENV=production ./build.js
+
+      - name: Package plugin
+        id: package
+        run: |
+          version="${GITHUB_REF_TYPE:-branch}"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="$(git rev-parse --short HEAD)"
+          fi
+          tarball="${PLUGIN_NAME}-${version}.tar.gz"
+
+          # Stage dist/ under a directory named after the plugin so the tarball
+          # unpacks straight into /usr/local/share/cockpit/
+          staging="$(mktemp -d)"
+          mkdir -p "${staging}/${PLUGIN_NAME}"
+          cp -a dist/. "${staging}/${PLUGIN_NAME}/"
+
+          # Static content served by cockpit-ws: readable by all, writable
+          # only by root once extracted.
+          find "${staging}/${PLUGIN_NAME}" -type d -exec chmod 0755 {} +
+          find "${staging}/${PLUGIN_NAME}" -type f -exec chmod 0644 {} +
+
+          # Record root ownership in the archive. Without this the runner's
+          # uid (1001) is stored and root's default --same-owner restores it
+          # on the target, where 1001 is an unrelated local account.
+          tar -czf "${tarball}" \
+            --owner=root --group=root --numeric-owner \
+            -C "${staging}" "${PLUGIN_NAME}"
+
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          tar -tzf "${tarball}"
+
+      - name: Build installer
+        id: installer
+        run: |
+          set -euo pipefail
+          script_name="$(bash scripts/make_installer.sh \
+            "${PLUGIN_NAME}" \
+            "${{ steps.package.outputs.version }}" \
+            "${{ steps.package.outputs.tarball }}" \
+            "" \
+            "" \
+            "${STRIP_COMPONENTS}")"
+          echo "script_name=${script_name}" >> "$GITHUB_OUTPUT"
+          echo "signed_tar=${script_name}.signed.tar" >> "$GITHUB_OUTPUT"
+
+      - name: Decode GPG key
+        run: |
+          echo "${{ secrets.INSTALLER_GPG_PRIVATE_KEY }}" | base64 -d | gpg --batch --import -
+
+      - name: Sign the installer
+        run: |
+          gpg --batch --yes \
+            --output "${{ steps.installer.outputs.script_name }}.sig" \
+            --detach-sig "${{ steps.installer.outputs.script_name }}"
+
+      - name: Cleanup GPG keys
+        if: always()
+        run: |
+          FINGERPRINT=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
+          if [ -n "$FINGERPRINT" ]; then
+            gpg --batch --yes --delete-secret-keys "$FINGERPRINT"
+            gpg --batch --yes --delete-keys "$FINGERPRINT"
+          fi
+
+      - name: Package signed tar
+        run: |
+          tar -cf "${{ steps.installer.outputs.signed_tar }}" \
+            "${{ steps.installer.outputs.script_name }}" \
+            "${{ steps.installer.outputs.script_name }}.sig" \
+            "${{ steps.package.outputs.tarball }}"
+
+      - name: Upload signed tar artifact
+        uses: actions/upload-artifact@v7
+        with:
+          # archive: false uploads the .signed.tar as-is. The default would zip
+          # it, leaving whoever downloads it to unwrap a zip around a tar.
+          name: ${{ steps.installer.outputs.signed_tar }}
+          path: ${{ steps.installer.outputs.signed_tar }}
+          if-no-files-found: error
+          retention-days: 30
+          archive: false
+
+      - name: Attach signed tar to release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED_TAR: ${{ steps.installer.outputs.signed_tar }}
+        run: |
+          # The plugin .tar.gz ships inside the signed tar, so only the signed
+          # bundle is attached: the updater consumes that, not the bare tarball.
+          #
+          # The release may already exist: created from the GitHub UI, or a
+          # re-run of this build. Upload into it rather than failing.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${SIGNED_TAR}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "${SIGNED_TAR}" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes \
+              --verify-tag
+          fi
